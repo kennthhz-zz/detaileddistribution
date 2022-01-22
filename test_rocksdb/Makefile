@@ -8,13 +8,13 @@ ifndef DISABLE_JEMALLOC
 	PLATFORM_CXXFLAGS += $(JEMALLOC_INCLUDE)
 endif
 
-CFLAGS += -Wstrict-prototypes
+#CFLAGS += -Wstrict-prototypes
 
 .PHONY: clean librocksdb
 
 all:async_demo
 
 async_demo: async_demo.cc
-	$(CXX) $(CXXFLAGS) $@.cc -g -o$@ ../../rocksdb/librocksdb.a -I../../rocksdb/include -I../include -I../../liburing/src/include -L../../liburing/src/ -std=c++20 -fcoroutines -luring -D_GUN_SOURCE -fpermissive $(PLATFORM_LDFLAGS) $(PLATFORM_CXXFLAGS) $(EXEC_LDFLAGS)
+	$(CXX) $(CXXFLAGS) $@.cc -g -O2 -o$@ ../../rocksdb_fork/rocksdb/librocksdb.a -I../../rocksdb_fork/rocksdb/include -I../include -I../../liburing/src/include -L../../liburing/src/ -frtti -std=c++20 -fcoroutines -luring -D_GUN_SOURCE -fpermissive $(PLATFORM_LDFLAGS) $(PLATFORM_CXXFLAGS) $(EXEC_LDFLAGS)
 clean:
 	rm -rf ./async_demo

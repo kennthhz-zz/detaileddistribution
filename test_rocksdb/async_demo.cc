@@ -15,82 +15,66 @@
 #include "rocksdb/async_result.h"
 #include "executor.h"
 #include "placement_strategy.h"
+#include <unordered_map>
 
+using namespace ROCKSDB_NAMESPACE;
 using namespace dd;
 
-struct io_uring *ioring = nullptr;
+int total_reads = 100000;
+std::atomic<int> completed_read_count = 0;
+static uint64_t RingSize = 1000;
+static bool direct_io_read = false;
+static int completion_batch_size = 100;
 
-const int BILLION = 1000000000L;
+constexpr int num_keys = 512 * 1024;
+const std::string kDBPath = "/tmp";
+
+struct DbInfo {
+  DB* db;
+  struct io_uring* io_uring;
+};
+
+std::unordered_map<std::string, DbInfo> DbInfos;
 using namespace ROCKSDB_NAMESPACE;
 using namespace std::chrono_literals;
 
-std::string kDBPath = "/tmp/rocksdb_simple_example";
-
-constexpr int total_count = 500000;
-const int batch_size = 1024;
-constexpr int batch_count = total_count / batch_size;
-
-/**
- * @brief Generate 1kb sized value string
- * 
- * @return std::string 
- */
-std::string generate_value_string() { 
-  std::string value;
-  for (int i = 0; i < 32; i++)
-    value.append("123456789012345678901234567890ab");
-  return value;
-}
-
-void generate_keys(std::vector<rocksdb::Slice>& results) {
-  
-  for (int i = 0; i < total_count; i++) {
-    std::string s("key_");
-    s.append(std::to_string(i));
-    auto slice = Slice(s);
-    results.push_back(slice);
-  }
-}
-
-void WriteDB(DB* db, std::vector<rocksdb::Slice>& keys, std::string& value) {
+void WriteDB(DB* db, int num_keys, int size) {
   Status s;
   WriteOptions write_options; 
   write_options.disableWAL = false;
-  for (int i = 0; i < total_count; i++) {
-    s = db->Put(write_options, keys.at(i), value);
-    //std::cout<<"Write key:"<<keys.at(i).data()<<" value:"<<value<<"\n";
+  char value[size];
+  memset(value, '#', size);
+
+  for (int i = 0; i < num_keys; i++) {
+    s = db->Put(write_options, std::to_string(i), value);
     assert(s.ok());
   }
 }
 
-void SetCpu(std::thread& thread) {
-  // affinitize thread to vcore 
-  cpu_set_t cpuset;
-  CPU_ZERO(&cpuset);
-  CPU_SET(0, &cpuset);
-  int rc = pthread_setaffinity_np(thread.native_handle(), sizeof(cpu_set_t), &cpuset);
-  if (rc != 0) {
-  }
+static void msec_to_ts(struct __kernel_timespec *ts, unsigned int msec)
+{
+	ts->tv_sec = msec / 1000;
+	ts->tv_nsec = (msec % 1000) * 1000000;
 }
 
-static void reap_iouring_completion(struct io_uring *ring, std::string partition_id, Executor* executor) {
-  struct io_uring_cqe *cqe;
-  while (true) {
-    auto ret = io_uring_wait_cqe(ring, &cqe);
-    if (ret == 0 && cqe->res >=0) {
-      struct file_read_page *rdata =(file_read_page *)io_uring_cqe_get_data(cqe);
-      io_uring_cqe_seen(ring, cqe);
-
-      auto h = std::coroutine_handle<async_result::promise_type>::from_promise(*rdata->promise);
-      executor->AddCPUTask([&h](const IExecutor::TaskArgs& args) { 
+static void reap_iouring_completion(struct io_uring *ring, std::string partition_id, IExecutor* executor) {
+  struct io_uring_cqe *cqes[completion_batch_size];  
+  while(true) {
+    auto ret = io_uring_peek_batch_cqe(ring, cqes, completion_batch_size);
+    if (ret > 0) {
+      for (int i = 0; i < ret; i++) {
+        struct file_page *rdata =(struct file_page *)io_uring_cqe_get_data(cqes[i]);
+        io_uring_cqe_seen(ring, cqes[i]);
+        auto h = std::coroutine_handle<async_result::promise_type>::from_promise(*rdata->promise);
         h.resume();
-        }, partition_id, IExecutor::TaskPriority::kHigh);
-      return;
+      }
+    } else {
+      break;
     }
   }
 }
 
-async_result work(bool write, bool async) {
+DB* OpenDb(std::string dbName) {
   DB* db;
   Options options;
   options.IncreaseParallelism();
@@ -99,102 +83,127 @@ async_result work(bool write, bool async) {
   options.write_buffer_size = 64 << 20; //1mb
   options.max_write_buffer_number = 1;
   options.min_write_buffer_number_to_merge = 2;
-  options.use_direct_reads = true;
+  options.use_direct_reads = direct_io_read;
   options.use_direct_io_for_flush_and_compaction = false;
   BlockBasedTableOptions block_based_options;
   block_based_options.no_block_cache = true;
   options.table_factory.reset(NewBlockBasedTableFactory(block_based_options));
 
-  // open DB
-  Status s = DB::Open(options, kDBPath, &db);
+  Status s = DB::Open(options, kDBPath + "/" + dbName, &db);
   assert(s.ok());
-  std::unique_ptr<DB> u_db(db);
+  return db;
+}
 
-  // Generate keys and value
-  std::vector<rocksdb::Slice> keys;
-  for (int i = 0; i < total_count; i++) {
-    auto s = new std::string("key_");
-    s->append(std::to_string(i));
-    auto slice = Slice(*s);
-    keys.push_back(slice);
-  }
-
-  auto value = generate_value_string();
-
-  if (write) {
-    std::cout<<"Write date to DB first\n";
-    WriteDB(db, keys, value);
-  }
-
-  std::cout<<"Hit any key to compact and read\n";
-  std::string input;
-  std::getline(std::cin, input);
-
-  struct timespec start, end;
-  PinnableSlice* pin_values = new PinnableSlice[batch_size];
-  std::unique_ptr<PinnableSlice[]> pin_values_guard(pin_values);
-  std::vector<Status> stat_list(batch_size);
-
-  std::cout<<"start read\n";
-
-
+async_result ReadOne(DB* db, ReadOptions ro, int key) {
   PinnableSlice get_value;
-  ReadOptions ro;
-  ro.read_tier == kPersistedTier;
-
-  if (!async) {
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    s = db->Get(ReadOptions(), db->DefaultColumnFamily(), keys[0], &get_value);
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    std::cout<<"Get key: "<<keys[0].data()<<" return is "<<s.ok()<<"\n";
-    std::cout<<"Result:"<<get_value.data()<<"\n";
-  } else  {
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    auto a_result = db->AsyncGet(ReadOptions(), db->DefaultColumnFamily(), keys[0], &get_value, nullptr);
-    co_await a_result;
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    std::cout<<"Async Get key: "<<keys[0].data()<<" return is "<<a_result.result().ok()<<"\n";
-    std::cout<<"Result:"<<get_value.data()<<"\n";
+  auto a_result = db->AsyncGet(ro, db->DefaultColumnFamily(), std::to_string(key), &get_value, nullptr);
+  co_await a_result;
+  if (a_result.result().ok()) {
+    completed_read_count++;
   }
+}
 
-  uint64_t diff;
-  diff = BILLION * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec;
-  std::cout<<"Sequential read elapsed time: "<< diff <<" usec.\n";
-
-  u_db->Close();
+void print_usage() {
+  std::cout<<"usage: async_demo w\n";
+  std::cout<<"usage: async_demo r --total_reads [number of read requests] --direct_io --ring_size [size of io_uring] --completion_batch_size [size of completion batch]\n";
 }
 
 int main(int argc, char *argv[]) {
+  if  (argc < 2) {
+    print_usage();
+    return 0;
+  }
 
-  std::vector<int> vcores = { 0, 1, 2, 3, 4 };
-  std::string partition_id("1");
+  if (*argv[1] == 'w') {
+      for (auto i = 0; i < 2; i++) {
+        std::unique_ptr<DB> db(OpenDb("db_" + std::to_string(i)));
+        std::cout<<"Write date to DB first\n";
+        WriteDB(db.get(), num_keys, 1024);
+        db->Close();
+      }
+      return 1;
+  }
+
+  if (*argv[1] != 'r') {
+    print_usage();
+    return 0;
+  }
+
+  for (int i = 2; i < argc; i++) {
+    std::string opt(argv[i]);
+    if (opt.compare("--total_reads") == 0) {
+      total_reads = std::stoi(argv[i+1]);
+      i++;
+    } else if (opt.compare("--direct_io")==0) {
+      direct_io_read = true;
+
+    } else if (opt.compare("--ring_size")==0) {
+      RingSize = std::stoi(argv[i+1]);
+      i++;
+    } else if (opt.compare("--completion_batch_size")==0) {
+      completion_batch_size = std::stoi(argv[i+1]);
+      i++;
+    }
+  }
+
+  for (auto i = 0; i < 1; i++) {
+    std::string dbName = "db_" + std::to_string(i);
+    struct DbInfo info;
+    info.db = OpenDb(dbName); 
+    io_uring* ioring = new io_uring();
+    auto ret = io_uring_queue_init(RingSize, ioring, 0);
+    if( ret < 0) {
+      fprintf(stderr, "queue_init: %s\n", strerror(-ret));
+      return -1;
+    }
+
+    info.io_uring = ioring;
+    DbInfos[dbName] = info;
+  }
+
+  std::vector<int> vcores = { 0 };
   auto strategy = std::make_unique<DefaultPartitionPlacementStrategy>(std::move(vcores));
-  strategy->AddPartition(partition_id);
+  for (const auto& i : DbInfos) 
+    strategy->AddPartition(i.first);
   auto executor = std::make_unique<Executor>(std::move(strategy));
   executor->Start();
 
-  static const uint64_t RingSize = 1000;
-  bool write = false;
-  if (*argv[1] == 'w') {
-    write = true;
+  std::srand(std::time(nullptr)); 
+  int db_index = 0;
+  std::string db_name = "db_" + std::to_string(db_index);
+  auto db = DbInfos[db_name].db;
+
+  ReadOptions ro;
+  ro.read_tier == kPersistedTier;
+  auto io_uring_opt = new IOUringOptions(DbInfos[db_name].io_uring);
+  ro.io_uring_option = io_uring_opt;
+
+  auto start = std::chrono::steady_clock::now();
+  for(auto i = 0; i < total_reads; i++) {
+    auto r = std::rand();
+    int key_index = r % num_keys;
+    bool ret = executor->AddCPUTask([&ro, db, db_name, key_index](const IExecutor::TaskArgs& args) { 
+          ReadOne(DbInfos[db_name].db, ro, key_index);
+          }, db_name, IExecutor::TaskPriority::kMedium);
+
+    if (i % 1000 == 0)
+      executor->AddCPUTask([i, db, db_name, key_index, ex =executor.get()](const IExecutor::TaskArgs& args) { 
+        reap_iouring_completion(DbInfos[db_name].io_uring, db_name, ex);
+      }, db_name, IExecutor::TaskPriority::kMedium);
   }
 
-  bool async = false;
-  if (*argv[2] == 'a') {
-    async = true;
+  while(true) {
+    if (completed_read_count >= total_reads)
+      break;
+    std::this_thread::sleep_for(100ms);
+    executor->AddCPUTask([db_name, ex =executor.get()](const IExecutor::TaskArgs& args) { 
+      reap_iouring_completion(DbInfos[db_name].io_uring, db_name, ex);
+    }, db_name, IExecutor::TaskPriority::kMedium);
   }
+  auto stop = std::chrono::steady_clock::now();
+  auto latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count();
 
-  ioring = new io_uring();
-  auto ret = io_uring_queue_init(RingSize, ioring, 0);
-  if( ret < 0) {
-    fprintf(stderr, "queue_init: %s\n", strerror(-ret));
-    return -1;
-  }
-  
-  std::thread t1(reap_iouring_completion, ioring, partition_id, executor.get());
-  executor->AddCPUTask([write, async](const IExecutor::TaskArgs& args) { 
-        work(write, async);
-        }, partition_id, IExecutor::TaskPriority::kHigh);
-  t1.join();
+  std::cout<<"Total completed 1k read:"<<completed_read_count<<" in "<<(double)latency_ns/1000000000<<" seconds with average request latency:"<<((double)latency_ns/1000)/total_reads<<" usecs\n";
+  std::cout<<"rps:"<<total_reads/((double)latency_ns/1000000000)<<"/s\n";
   executor->Shutdown();
 }

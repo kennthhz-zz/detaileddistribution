@@ -49,7 +49,7 @@ class Executor final : public IExecutor {
 
  public:
   explicit Executor(std::unique_ptr<IPartitionPlacementStrategy> placement_strategy) : 
-    placement_strategy_{std::move(placement_strategy)} {
+    placement_strategy_{std::move(placement_strategy)}, shutdown_{false} {
 
     for (auto& vcore : placement_strategy_->get_vcores()) {
       mpsc_executors_.emplace_back(std::make_unique<MpScExecutor>(vcore));
@@ -95,7 +95,7 @@ class Executor final : public IExecutor {
  private:
   class MpScExecutor final {
    public:
-    explicit MpScExecutor(int vcore) : vcore_(vcore), counter_{0}, sleep_after_idle_{false} {
+    explicit MpScExecutor(int vcore) : vcore_(vcore), counter_{0}, sleep_after_idle_{false}, shutdown_{false} {
     }
 
     void Start(IExecutor *executor) {
@@ -136,8 +136,10 @@ class Executor final : public IExecutor {
       current_thread_executor_vcore = vcore;
       auto last_dequeue = std::chrono::steady_clock::now();
       while (true) {
-        if (e->shutdown_)
+        if (e->shutdown_) {
+          std::cout<<"shutdown signaled\n";
           break;
+        }
 
         auto tmp = (e->counter_++) % TaskPriority_TotalWeight() + 1;
         auto p = TaskPriority::kLowest;
@@ -182,7 +184,7 @@ class Executor final : public IExecutor {
     const int vcore_;
     std::thread thread_;
     uint_fast64_t counter_;
-    bool shutdown_;
+    bool shutdown_ = false;
     std::mutex idle_condition_mtx_;
     std::condition_variable idle_condition_;
     bool sleep_after_idle_;
@@ -194,6 +196,6 @@ class Executor final : public IExecutor {
   using MpScExecutorPtrs = std::vector<MpScExecutorPtr>;
   MpScExecutorPtrs mpsc_executors_;
   std::unique_ptr<IPartitionPlacementStrategy> placement_strategy_;
-  std::atomic<bool> shutdown_;
+  std::atomic<bool> shutdown_ = false;
 };
 }  // namespace dd
