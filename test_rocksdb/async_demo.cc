@@ -82,12 +82,16 @@ static void msec_to_ts(struct __kernel_timespec *ts, unsigned int msec)
 static void reap_iouring_completion(struct io_uring *ring, std::string partition_id, IExecutor* executor) {
   struct io_uring_cqe *cqes[completion_batch_size];  
   while(true) {
+    // Here are not using wait to block the completion thread.
+    // We are busy polling completions using batched peak
     auto ret = io_uring_peek_batch_cqe(ring, cqes, completion_batch_size);
     if (ret > 0) {
       for (int i = 0; i < ret; i++) {
         struct file_page *rdata =(struct file_page *)io_uring_cqe_get_data(cqes[i]);
         io_uring_cqe_seen(ring, cqes[i]);
         auto h = std::coroutine_handle<async_result::promise_type>::from_promise(*rdata->promise);
+
+        // invoke C++20 coroutine resumption.
         h.resume();
       }
     } else {
@@ -183,6 +187,12 @@ int main(int argc, char *argv[]) {
     DbInfos[dbName] = info;
   }
 
+  // Here we use our task based, one-thread-per-core executor to run async read tasks.
+  // To maximize the performance, the execution thread is bound to a specific vcore 0.
+  // The task queue is lock free with one producer and one consumer. The async completion
+  // is also done in the task under the same task queue. 
+  // So there is no thread context switch in async processing (except for app's main thread which is doing the submission);
+  // none of the task is ever blocked by IO; The CPU at vcore 0 should run at 100%. 
   std::vector<int> vcores = { 0 };
   auto strategy = std::make_unique<DefaultPartitionPlacementStrategy>(std::move(vcores));
   for (const auto& i : DbInfos) 
@@ -208,12 +218,14 @@ int main(int argc, char *argv[]) {
           ReadOne(DbInfos[db_name].db, ro, key_index);
           }, db_name, IExecutor::TaskPriority::kMedium);
 
+    // We need to sprinkle IO completion with IO submition task or io_uring submission queue will over flow. 
     if (i % 1000 == 0)
       executor->AddCPUTask([i, db, db_name, key_index, ex =executor.get()](const IExecutor::TaskArgs& args) { 
         reap_iouring_completion(DbInfos[db_name].io_uring, db_name, ex);
       }, db_name, IExecutor::TaskPriority::kMedium);
   }
 
+  // This part is to simiulate continous IO completion after all async read requests have been submitted.
   while(true) {
     if (completed_read_count >= total_reads)
       break;
@@ -222,6 +234,7 @@ int main(int argc, char *argv[]) {
       reap_iouring_completion(DbInfos[db_name].io_uring, db_name, ex);
     }, db_name, IExecutor::TaskPriority::kMedium);
   }
+
   auto stop = std::chrono::steady_clock::now();
   auto latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count();
 
